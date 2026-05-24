@@ -232,12 +232,47 @@
   @media screen and (max-width: 768px) {
     .modal input, .modal select, .modal textarea, .cat-add-row input { font-size: 16px !important; }
   }
+
+  /* Auth overlay (blocks app until signed in) */
+  .auth-overlay { position: fixed; inset: 0; background: var(--bg); display: flex; align-items: center; justify-content: center; z-index: 999; padding: 1rem; }
+  .auth-overlay.hide { display: none; }
+  .auth-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 2.2rem 2rem; max-width: 380px; width: 100%; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.06); }
+  .auth-card h2 { font-family: 'Playfair Display', serif; font-size: 1.6rem; margin-bottom: 0.6rem; }
+  .auth-card p { color: var(--muted); font-size: 0.88rem; line-height: 1.5; margin-bottom: 1.6rem; }
+  .auth-btn { background: var(--accent); color: #fff; border: none; border-radius: 12px; padding: 0.75rem 1.4rem; font-family: 'DM Sans', sans-serif; font-size: 0.95rem; font-weight: 500; cursor: pointer; width: 100%; }
+  .auth-btn:hover { filter: brightness(0.95); }
+  .auth-err { color: #d95f5f; font-size: 0.82rem; margin-top: 0.8rem; min-height: 1em; }
+
+  /* Account chip (top-right) */
+  .acct-chip { position: fixed; top: 0.8rem; right: 0.8rem; background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 0.3rem 0.8rem 0.3rem 0.5rem; font-size: 0.78rem; color: var(--muted); display: none; align-items: center; gap: 0.5rem; z-index: 100; box-shadow: 0 2px 6px rgba(0,0,0,0.04); }
+  .acct-chip.show { display: flex; }
+  .acct-chip .acct-email { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .acct-chip button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 0.78rem; padding: 0 0.2rem; }
+  .acct-chip button:hover { color: var(--accent); }
+  .uid-line { font-size: 0.7rem; color: var(--muted); margin-top: 1rem; padding: 0.6rem; background: var(--bg); border-radius: 8px; word-break: break-all; font-family: monospace; }
 </style>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
 <script src="config.js"></script>
 </head>
 <body>
+
+<!-- Sign-in overlay — shown until Firebase Auth confirms a user -->
+<div id="auth-overlay" class="auth-overlay">
+  <div class="auth-card">
+    <h2>Sign in</h2>
+    <p>One sign-in per device. Your tasks stay private and sync across your devices.</p>
+    <button class="auth-btn" id="signin-btn">Sign in with Google</button>
+    <div class="auth-err" id="auth-err"></div>
+  </div>
+</div>
+
+<!-- Account chip (top-right, once signed in) -->
+<div id="acct-chip" class="acct-chip">
+  <span class="acct-email" id="acct-email"></span>
+  <button id="signout-btn" title="Sign out">Sign out</button>
+</div>
 
 <header>
   <h1>Weekly Planner</h1>
@@ -416,17 +451,71 @@
 const SK = 'weeklyPlanner_personal_v3';
 const CAT_COLORS = ['#a8c5a0','#c9a8d4','#a8c0d4','#d4c4a0','#d4a0a0','#a0c4d4','#d4b0a0','#b0d4a0','#d4a0c4','#a0b4d4'];
 
-// ── Firebase (personal + shared nodes) ────────────────────────────────────────
+// ── Firebase (personal + shared nodes, gated by Auth) ─────────────────────────
 const SHARED_CACHE_KEY = 'weeklyPlanner_shared_cache_v1';
 let SHARED = { categories: [], repeatingTasks: [], oneOffTasks: {}, checked: {}, counters: {} };
 let sharedDbRef = null;
 let personalDbRef = null;
+let currentUser = null;
 try {
   firebase.initializeApp(window.FIREBASE_CONFIG);
   sharedDbRef   = firebase.database().ref('planner');
   personalDbRef = firebase.database().ref('weekly-personal');
 } catch(e) {
   console.warn('Firebase unavailable, running offline:', e.message);
+}
+
+function showAuthOverlay(show) {
+  const o = document.getElementById('auth-overlay');
+  if (o) o.classList.toggle('hide', !show);
+  const chip = document.getElementById('acct-chip');
+  if (chip) chip.classList.toggle('show', !show);
+}
+function setupAuth() {
+  if (typeof firebase === 'undefined' || !firebase.auth) {
+    // No SDK — skip auth (e.g. fully offline). Personal still works via localStorage.
+    showAuthOverlay(false);
+    return;
+  }
+  firebase.auth().onAuthStateChanged((user) => {
+    currentUser = user || null;
+    if (user) {
+      console.log('Signed in:', user.email, '\nYour UID:', user.uid);
+      document.getElementById('acct-email').textContent = user.email || 'signed in';
+      showAuthOverlay(false);
+      attachDbListeners();
+    } else {
+      showAuthOverlay(true);
+      detachDbListeners();
+    }
+  });
+  document.getElementById('signin-btn').addEventListener('click', () => {
+    const errEl = document.getElementById('auth-err');
+    errEl.textContent = '';
+    const provider = new firebase.auth.GoogleAuthProvider();
+    firebase.auth().signInWithPopup(provider).catch(e => {
+      // Popup blocked on iOS? Fall back to redirect.
+      if (e.code === 'auth/popup-blocked' || e.code === 'auth/operation-not-supported-in-this-environment') {
+        firebase.auth().signInWithRedirect(provider);
+      } else {
+        errEl.textContent = e.message || 'Sign-in failed';
+      }
+    });
+  });
+  document.getElementById('signout-btn').addEventListener('click', () => firebase.auth().signOut());
+}
+
+let _personalSub = false, _sharedSub = false;
+function attachDbListeners() {
+  if (personalDbRef && !_personalSub) { _personalSub = true; subscribePersonal(); }
+  if (sharedDbRef   && !_sharedSub)   { _sharedSub   = true; subscribeShared();   }
+}
+function detachDbListeners() {
+  if (personalDbRef) personalDbRef.off();
+  if (sharedDbRef)   sharedDbRef.off();
+  _personalSub = false; _sharedSub = false;
+  setPersonalSyncStatus('offline');
+  setSharedSyncStatus('none');
 }
 function setPersonalSyncStatus(status) {
   const el = document.getElementById('personal-sync-status');
@@ -471,7 +560,7 @@ function setSharedSyncStatus(status) {
 }
 function saveShared() {
   saveSharedToCache();
-  if (!sharedDbRef) { setSharedSyncStatus('offline'); return; }
+  if (!sharedDbRef || !currentUser) { setSharedSyncStatus('offline'); return; }
   setSharedSyncStatus('saving');
   sharedDbRef.set(JSON.parse(JSON.stringify(SHARED)))
     .then(()=>setSharedSyncStatus('saved'))
@@ -550,7 +639,7 @@ function migrateKeys(state) {
 }
 function saveState() {
   localStorage.setItem(SK, JSON.stringify(S));
-  if (!personalDbRef) { setPersonalSyncStatus('offline'); return; }
+  if (!personalDbRef || !currentUser) { setPersonalSyncStatus('offline'); return; }
   setPersonalSyncStatus('saving');
   personalDbRef.set(JSON.parse(JSON.stringify(S)))
     .then(()=>setPersonalSyncStatus('saved'))
@@ -1443,8 +1532,7 @@ if (!S.categories || !S.categories.length) S.categories = defaultState().categor
 renderBar();
 renderWeek();
 
-// Subscribe to personal Firebase node — cross-device sync for personal data
-if (personalDbRef) {
+function subscribePersonal() {
   setPersonalSyncStatus('loading');
   personalDbRef.on('value', (snapshot) => {
     const remote = snapshot.val();
@@ -1461,7 +1549,6 @@ if (personalDbRef) {
       localStorage.setItem(SK, JSON.stringify(S));
       setPersonalSyncStatus('saved');
     } else {
-      // Nothing in Firebase yet — push current local data up
       setPersonalSyncStatus('saving');
       personalDbRef.set(JSON.parse(JSON.stringify(S)))
         .then(()=>setPersonalSyncStatus('saved'))
@@ -1472,12 +1559,9 @@ if (personalDbRef) {
     if (document.getElementById('panel-goals').classList.contains('active'))   renderGoals();
     if (document.getElementById('panel-recipes').classList.contains('active')) { renderCategoryBar(); renderRecipes(); }
   }, () => setPersonalSyncStatus('offline'));
-} else {
-  setPersonalSyncStatus('offline');
 }
 
-// Subscribe to shared-planner's Firebase node — live merges into the weekly view
-if (sharedDbRef) {
+function subscribeShared() {
   setSharedSyncStatus('loading');
   sharedDbRef.on('value', (snapshot) => {
     const remote = snapshot.val();
@@ -1491,9 +1575,9 @@ if (sharedDbRef) {
     }
     renderWeek();
   }, () => setSharedSyncStatus('offline'));
-} else {
-  setSharedSyncStatus(SHARED.repeatingTasks.length || Object.keys(SHARED.oneOffTasks).length ? 'offline' : 'none');
 }
+
+setupAuth();
 
 </script>
 </body>

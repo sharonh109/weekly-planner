@@ -1,4 +1,4 @@
-const CACHE = 'weekly-planner-v2';
+const CACHE = 'weekly-planner-v3';
 
 const ASSETS = [
   './index.html',
