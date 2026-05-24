@@ -56,6 +56,9 @@
   .task-item input:checked + .task-text { text-decoration: line-through; color: var(--muted); }
 
   .repeat-badge { font-size: 0.6rem; background: var(--accent-light); color: var(--accent); padding: 1px 5px; border-radius: 10px; white-space: nowrap; }
+  .shared-badge { font-size: 0.6rem; background: #e4ecf7; color: #3f6aa8; padding: 1px 5px; border-radius: 10px; white-space: nowrap; }
+  .task-item.shared, .counter-item.shared { background: #f4f7fc; }
+  .task-item.shared:hover, .counter-item.shared:hover { background: #ebf1fa; }
 
   /* Task menu button */
   .task-menu-btn {
@@ -230,12 +233,17 @@
     .modal input, .modal select, .modal textarea, .cat-add-row input { font-size: 16px !important; }
   }
 </style>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script src="config.js"></script>
 </head>
 <body>
 
 <header>
   <h1>Weekly Planner</h1>
   <p id="header-sub"></p>
+  <p id="personal-sync-status" style="font-size:0.7rem;margin-top:0.3rem;color:#9c9189"></p>
+  <p id="shared-sync-status" style="font-size:0.7rem;margin-top:0.15rem;color:#9c9189"></p>
 </header>
 
 <!-- Tab bar -->
@@ -408,6 +416,69 @@
 const SK = 'weeklyPlanner_personal_v3';
 const CAT_COLORS = ['#a8c5a0','#c9a8d4','#a8c0d4','#d4c4a0','#d4a0a0','#a0c4d4','#d4b0a0','#b0d4a0','#d4a0c4','#a0b4d4'];
 
+// ── Firebase (personal + shared nodes) ────────────────────────────────────────
+const SHARED_CACHE_KEY = 'weeklyPlanner_shared_cache_v1';
+let SHARED = { categories: [], repeatingTasks: [], oneOffTasks: {}, checked: {}, counters: {} };
+let sharedDbRef = null;
+let personalDbRef = null;
+try {
+  firebase.initializeApp(window.FIREBASE_CONFIG);
+  sharedDbRef   = firebase.database().ref('planner');
+  personalDbRef = firebase.database().ref('weekly-personal');
+} catch(e) {
+  console.warn('Firebase unavailable, running offline:', e.message);
+}
+function setPersonalSyncStatus(status) {
+  const el = document.getElementById('personal-sync-status');
+  if (!el) return;
+  const map = {
+    loading: '↓ Loading…',
+    saved:   '✓ Synced',
+    saving:  '↑ Saving…',
+    offline: '⚠ Offline (saved locally)',
+  };
+  el.textContent = map[status] ?? '';
+}
+function loadSharedFromCache() {
+  try {
+    const r = localStorage.getItem(SHARED_CACHE_KEY);
+    if (r) SHARED = JSON.parse(r);
+  } catch(e) {}
+  normalizeShared();
+}
+function saveSharedToCache() {
+  try { localStorage.setItem(SHARED_CACHE_KEY, JSON.stringify(SHARED)); } catch(e) {}
+}
+function normalizeShared() {
+  if (!SHARED || typeof SHARED !== 'object') SHARED = {};
+  if (!Array.isArray(SHARED.categories))     SHARED.categories = [];
+  if (!Array.isArray(SHARED.repeatingTasks)) SHARED.repeatingTasks = [];
+  if (!SHARED.oneOffTasks || typeof SHARED.oneOffTasks !== 'object') SHARED.oneOffTasks = {};
+  if (!SHARED.checked  || typeof SHARED.checked  !== 'object') SHARED.checked  = {};
+  if (!SHARED.counters || typeof SHARED.counters !== 'object') SHARED.counters = {};
+}
+function setSharedSyncStatus(status) {
+  const el = document.getElementById('shared-sync-status');
+  if (!el) return;
+  const map = {
+    loading: '↓ Loading shared items…',
+    saved:   '✓ Shared items synced',
+    saving:  '↑ Saving shared change…',
+    offline: '⚠ Shared items offline (showing cached)',
+    none:    ''
+  };
+  el.textContent = map[status] ?? '';
+}
+function saveShared() {
+  saveSharedToCache();
+  if (!sharedDbRef) { setSharedSyncStatus('offline'); return; }
+  setSharedSyncStatus('saving');
+  sharedDbRef.set(JSON.parse(JSON.stringify(SHARED)))
+    .then(()=>setSharedSyncStatus('saved'))
+    .catch(()=>setSharedSyncStatus('offline'));
+}
+loadSharedFromCache();
+
 function defaultState() {
   return {
     categories: [
@@ -479,6 +550,11 @@ function migrateKeys(state) {
 }
 function saveState() {
   localStorage.setItem(SK, JSON.stringify(S));
+  if (!personalDbRef) { setPersonalSyncStatus('offline'); return; }
+  setPersonalSyncStatus('saving');
+  personalDbRef.set(JSON.parse(JSON.stringify(S)))
+    .then(()=>setPersonalSyncStatus('saved'))
+    .catch(()=>setPersonalSyncStatus('offline'));
 }
 
 let S = loadLocalState();
@@ -496,7 +572,13 @@ function dk(d) {
 }
 function addD(d,n) { const r=new Date(d); r.setDate(r.getDate()+n); return r; }
 function weekStart(o=0) { const n=new Date(),d=n.getDay()||7,m=new Date(n); m.setDate(n.getDate()-d+1+o*7); m.setHours(0,0,0,0); return m; }
-function catById(id) { return S.categories.find(c=>c.id===id)||{name:'Other',color:'#bbb'}; }
+function catById(id) { return S.categories.find(c=>c.id===id)||SHARED.categories.find(c=>c.id===id)||{name:'Other',color:'#bbb'}; }
+function allCategories() {
+  const seen = new Set(); const out = [];
+  S.categories.forEach(c => { if (!seen.has(c.id)) { seen.add(c.id); out.push(c); } });
+  SHARED.categories.forEach(c => { if (!seen.has(c.id)) { seen.add(c.id); out.push(c); } });
+  return out;
+}
 
 function repeatOK(task, date) {
   const dow=date.getDay(), a=new Date(task.anchorDate+'T00:00:00');
@@ -518,7 +600,17 @@ function repeatLabel(r){ return {daily:'Daily',weekly:'Weekly','2days':'Every 2 
 
 function tasksForDate(date) {
   const key=dk(date);
-  return { rep:(S.repeatingTasks||[]).filter(t=>repeatOK(t,date)), one:(S.oneOffTasks[key]||[]) };
+  const tagShared = arr => (arr||[]).map(t => ({...t, _source:'shared'}));
+  return {
+    rep: [
+      ...(S.repeatingTasks||[]).filter(t=>repeatOK(t,date)),
+      ...tagShared(SHARED.repeatingTasks).filter(t=>repeatOK(t,date)),
+    ],
+    one: [
+      ...(S.oneOffTasks[key]||[]),
+      ...tagShared(SHARED.oneOffTasks[key]),
+    ],
+  };
 }
 
 // ── Progress ──────────────────────────────────────────────────────────────────
@@ -527,8 +619,9 @@ function refreshProgress(k) {
   let tot=0,done=0;
   [...rep,...one].forEach(t=>{
     const ck=`${k}::${t.id}`;
-    if(t.taskType==='counter'){const g=t.goal||1,c=S.counters?.[ck]||0;tot+=g;done+=Math.min(c,g);}
-    else{tot++;if(S.checked[ck])done++;}
+    const store = t._source === 'shared' ? SHARED : S;
+    if(t.taskType==='counter'){const g=t.goal||1,c=store.counters?.[ck]||0;tot+=g;done+=Math.min(c,g);}
+    else{tot++;if(store.checked?.[ck])done++;}
   });
   const pct=tot?Math.round(done/tot*100):0;
   const pb=document.getElementById('prog-'+k),pl=document.getElementById('prog-label-'+k);
@@ -617,8 +710,9 @@ function renderWeek() {
     rep.forEach(t=>{(cm[t.catId]||(cm[t.catId]=[])).push({...t,isRep:true});});
     one.forEach(t=>{(cm[t.catId]||(cm[t.catId]=[])).push({...t,isRep:false});});
 
-    S.categories.forEach(cat=>{
+    allCategories().forEach(cat=>{
       const tasks = cm[cat.id] || [];
+      if (!tasks.length && !S.categories.find(c=>c.id===cat.id)) return; // skip empty shared-only cats
       const block=document.createElement('div'); block.className='category-block';
       block.innerHTML=`<div class="category-label"><span class="cat-dot" style="background:${cat.color}"></span>${cat.name}</div><ul class="task-list" id="tl-${key}-${cat.id}"></ul>`;
       body.appendChild(block);
@@ -631,27 +725,37 @@ function renderWeek() {
 
 function buildTaskEl(ul, task, key) {
   const ck=`${key}::${task.id}`;
+  const isShared = task._source === 'shared';
+  const store = isShared ? SHARED : S;
+  const persist = isShared ? saveShared : saveState;
+  const sharedCls = isShared ? ' shared' : '';
+  const sharedBadge = isShared ? '<span class="shared-badge">Shared</span>' : '';
   const li=document.createElement('li');
   li.dataset.id=task.id; li.dataset.date=key; li.dataset.rep=task.isRep;
+  if (isShared) li.dataset.source='shared';
 
   if(task.taskType==='counter'){
-    li.className='counter-item';
-    const goal=task.goal||1, cnt=S.counters?.[ck]||0, done=cnt>=goal;
+    li.className='counter-item'+sharedCls;
+    const goal=task.goal||1, cnt=store.counters?.[ck]||0, done=cnt>=goal;
     let dots=''; for(let d=0;d<goal;d++) dots+=`<button class="counter-dot${d<cnt?' filled':''}" data-i="${d}"></button>`;
-    li.innerHTML=`<span class="counter-text${done?' done':''}">${task.text}</span>${task.isRep?`<span class="repeat-badge">${repeatLabel(task.repeat)}</span>`:''}<div class="counter-dots">${dots}</div><span class="counter-fraction${done?' done':''}">${cnt}/${goal}</span><button class="task-menu-btn" title="Options">⋯</button><div class="task-menu-pop"><button class="pop-edit">✎ Edit</button><button class="pop-delete">✕ Delete</button></div>`;
+    li.innerHTML=`<span class="counter-text${done?' done':''}">${task.text}</span>${sharedBadge}${task.isRep?`<span class="repeat-badge">${repeatLabel(task.repeat)}</span>`:''}<div class="counter-dots">${dots}</div><span class="counter-fraction${done?' done':''}">${cnt}/${goal}</span><button class="task-menu-btn" title="Options">⋯</button><div class="task-menu-pop"><button class="pop-edit">✎ Edit</button><button class="pop-delete">✕ Delete</button></div>`;
     li.querySelectorAll('.counter-dot').forEach((dot,idx)=>{
       dot.addEventListener('click',()=>{
-        if(!S.counters)S.counters={};
-        const cur=S.counters[ck]||0;
-        S.counters[ck]=idx<cur?idx:idx+1;
-        saveState(); renderWeek();
+        if(!store.counters)store.counters={};
+        const cur=store.counters[ck]||0;
+        store.counters[ck]=idx<cur?idx:idx+1;
+        persist(); renderWeek();
       });
     });
   } else {
-    li.className='task-item';
-    const chk=!!S.checked[ck];
-    li.innerHTML=`<input type="checkbox" id="ck-${ck}"${chk?' checked':''}><label class="task-text" for="ck-${ck}">${task.text}</label>${task.isRep?`<span class="repeat-badge">${repeatLabel(task.repeat)}</span>`:''}<button class="task-menu-btn" title="Options">⋯</button><div class="task-menu-pop"><button class="pop-edit">✎ Edit</button><button class="pop-delete">✕ Delete</button></div>`;
-    li.querySelector('input').addEventListener('change',e=>{S.checked[ck]=e.target.checked;saveState();refreshProgress(key);});
+    li.className='task-item'+sharedCls;
+    const chk=!!store.checked?.[ck];
+    li.innerHTML=`<input type="checkbox" id="ck-${ck}"${chk?' checked':''}><label class="task-text" for="ck-${ck}">${task.text}</label>${sharedBadge}${task.isRep?`<span class="repeat-badge">${repeatLabel(task.repeat)}</span>`:''}<button class="task-menu-btn" title="Options">⋯</button><div class="task-menu-pop"><button class="pop-edit">✎ Edit</button><button class="pop-delete">✕ Delete</button></div>`;
+    li.querySelector('input').addEventListener('change',e=>{
+      if(!store.checked)store.checked={};
+      store.checked[ck]=e.target.checked;
+      persist(); refreshProgress(key);
+    });
   }
 
   // Menu button — toggle popover
@@ -679,13 +783,13 @@ function buildTaskEl(ul, task, key) {
     menuPop.classList.remove('open');
     menuBtn.classList.remove('open');
     if (task.isRep) {
-      S.repeatingTasks = S.repeatingTasks.filter(t => t.id !== task.id);
+      store.repeatingTasks = store.repeatingTasks.filter(t => t.id !== task.id);
     } else {
-      S.oneOffTasks[key] = (S.oneOffTasks[key] || []).filter(t => t.id !== task.id);
+      store.oneOffTasks[key] = (store.oneOffTasks[key] || []).filter(t => t.id !== task.id);
     }
-    delete S.checked[ck];
-    if (S.counters) delete S.counters[ck];
-    saveState();
+    if (store.checked)  delete store.checked[ck];
+    if (store.counters) delete store.counters[ck];
+    persist();
     renderWeek();
   });
   ul.appendChild(li);
@@ -727,7 +831,7 @@ function openEditModal(task, key) {
   g('task-modal-save').textContent  = 'Save Changes';
   g('task-name-input').value = task.text;
   g('task-date-input').value = task.isRep ? (task.anchorDate || key) : key;
-  populateCatSelect(task.catId);
+  populateCatSelect(task.catId, task._source === 'shared' ? 'shared' : 'personal');
 
   // Task type
   const isCounter = (task.taskType === 'counter');
@@ -755,10 +859,11 @@ function openEditModal(task, key) {
   g('task-name-input').focus();
 }
 
-function populateCatSelect(selectedId) {
+function populateCatSelect(selectedId, source) {
   const sel = g('task-cat-select');
   sel.innerHTML = '';
-  S.categories.forEach(c => {
+  const cats = source === 'shared' ? SHARED.categories : S.categories;
+  cats.forEach(c => {
     const o = document.createElement('option');
     o.value = c.id; o.textContent = c.name;
     if (c.id === selectedId) o.selected = true;
@@ -788,38 +893,48 @@ g('task-modal-save').onclick = () => {
   const goal     = isCounter ? Math.max(1, parseInt(g('task-goal-input').value) || 1) : null;
   const repeat   = isRepeating ? g('task-repeat-select').value : null;
 
+  const editingShared = editingTask && editingTask._source === 'shared';
+  const T = editingShared ? SHARED : S;
+  const persist = editingShared ? saveShared : saveState;
+  if (editingShared) {
+    if (!T.repeatingTasks) T.repeatingTasks = [];
+    if (!T.oneOffTasks)    T.oneOffTasks = {};
+    if (!T.checked)        T.checked = {};
+    if (!T.counters)       T.counters = {};
+  }
+
   if (editingTask) {
     // ── Edit mode ──
     if (editingTask.isRep) {
       if (isRepeating) {
         // Update repeating task in place
-        const t = S.repeatingTasks.find(t => t.id === editingTask.id);
+        const t = T.repeatingTasks.find(t => t.id === editingTask.id);
         if (t) { Object.assign(t, { text, catId, taskType, goal, repeat, anchorDate: dateVal }); }
       } else {
         // Convert repeating → one-off
-        S.repeatingTasks = S.repeatingTasks.filter(t => t.id !== editingTask.id);
-        if (!S.oneOffTasks[dateVal]) S.oneOffTasks[dateVal] = [];
-        S.oneOffTasks[dateVal].push({ id: editingTask.id, text, catId, taskType, goal });
+        T.repeatingTasks = T.repeatingTasks.filter(t => t.id !== editingTask.id);
+        if (!T.oneOffTasks[dateVal]) T.oneOffTasks[dateVal] = [];
+        T.oneOffTasks[dateVal].push({ id: editingTask.id, text, catId, taskType, goal });
       }
     } else {
       if (isRepeating) {
         // Convert one-off → repeating
-        S.oneOffTasks[editingDate] = (S.oneOffTasks[editingDate] || []).filter(t => t.id !== editingTask.id);
-        S.repeatingTasks.push({ id: editingTask.id, text, catId, taskType, goal, repeat, anchorDate: dateVal });
+        T.oneOffTasks[editingDate] = (T.oneOffTasks[editingDate] || []).filter(t => t.id !== editingTask.id);
+        T.repeatingTasks.push({ id: editingTask.id, text, catId, taskType, goal, repeat, anchorDate: dateVal });
       } else {
         // Update one-off, possibly moving to a new date
-        S.oneOffTasks[editingDate] = (S.oneOffTasks[editingDate] || []).filter(t => t.id !== editingTask.id);
+        T.oneOffTasks[editingDate] = (T.oneOffTasks[editingDate] || []).filter(t => t.id !== editingTask.id);
         if (dateVal !== editingDate) {
           const ok = `${editingDate}::${editingTask.id}`, nk = `${dateVal}::${editingTask.id}`;
-          if (S.checked[ok]    !== undefined) { S.checked[nk]    = S.checked[ok];    delete S.checked[ok]; }
-          if (S.counters?.[ok] !== undefined) { S.counters[nk]   = S.counters[ok];   delete S.counters[ok]; }
+          if (T.checked[ok]    !== undefined) { T.checked[nk]    = T.checked[ok];    delete T.checked[ok]; }
+          if (T.counters?.[ok] !== undefined) { T.counters[nk]   = T.counters[ok];   delete T.counters[ok]; }
         }
-        if (!S.oneOffTasks[dateVal]) S.oneOffTasks[dateVal] = [];
-        S.oneOffTasks[dateVal].push({ id: editingTask.id, text, catId, taskType, goal });
+        if (!T.oneOffTasks[dateVal]) T.oneOffTasks[dateVal] = [];
+        T.oneOffTasks[dateVal].push({ id: editingTask.id, text, catId, taskType, goal });
       }
     }
   } else {
-    // ── Add mode ──
+    // ── Add mode (always personal) ──
     if (isRepeating) {
       S.repeatingTasks.push({ id: 'r' + Date.now(), text, catId, taskType, goal, repeat, anchorDate: dateVal });
     } else {
@@ -828,7 +943,7 @@ g('task-modal-save').onclick = () => {
     }
   }
 
-  saveState();
+  persist();
   g('task-modal').classList.remove('open');
   renderWeek();
 };
@@ -1327,6 +1442,58 @@ if (!S.recipes) S.recipes = [];
 if (!S.categories || !S.categories.length) S.categories = defaultState().categories;
 renderBar();
 renderWeek();
+
+// Subscribe to personal Firebase node — cross-device sync for personal data
+if (personalDbRef) {
+  setPersonalSyncStatus('loading');
+  personalDbRef.on('value', (snapshot) => {
+    const remote = snapshot.val();
+    if (remote && typeof remote === 'object') {
+      S = remote;
+      if (!S.goals) S.goals = [];
+      if (!S.recipes) S.recipes = [];
+      if (!S.recipeCategories) S.recipeCategories = [];
+      if (!S.categories || !S.categories.length) S.categories = defaultState().categories;
+      if (!S.repeatingTasks) S.repeatingTasks = [];
+      if (!S.oneOffTasks) S.oneOffTasks = {};
+      if (!S.checked)  S.checked  = {};
+      if (!S.counters) S.counters = {};
+      localStorage.setItem(SK, JSON.stringify(S));
+      setPersonalSyncStatus('saved');
+    } else {
+      // Nothing in Firebase yet — push current local data up
+      setPersonalSyncStatus('saving');
+      personalDbRef.set(JSON.parse(JSON.stringify(S)))
+        .then(()=>setPersonalSyncStatus('saved'))
+        .catch(()=>setPersonalSyncStatus('offline'));
+    }
+    renderBar();
+    renderWeek();
+    if (document.getElementById('panel-goals').classList.contains('active'))   renderGoals();
+    if (document.getElementById('panel-recipes').classList.contains('active')) { renderCategoryBar(); renderRecipes(); }
+  }, () => setPersonalSyncStatus('offline'));
+} else {
+  setPersonalSyncStatus('offline');
+}
+
+// Subscribe to shared-planner's Firebase node — live merges into the weekly view
+if (sharedDbRef) {
+  setSharedSyncStatus('loading');
+  sharedDbRef.on('value', (snapshot) => {
+    const remote = snapshot.val();
+    if (remote && typeof remote === 'object') {
+      SHARED = remote;
+      normalizeShared();
+      saveSharedToCache();
+      setSharedSyncStatus('saved');
+    } else {
+      setSharedSyncStatus('none');
+    }
+    renderWeek();
+  }, () => setSharedSyncStatus('offline'));
+} else {
+  setSharedSyncStatus(SHARED.repeatingTasks.length || Object.keys(SHARED.oneOffTasks).length ? 'offline' : 'none');
+}
 
 </script>
 </body>
